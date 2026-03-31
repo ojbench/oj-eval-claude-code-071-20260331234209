@@ -1,116 +1,209 @@
-#ifndef SRC_HPP
-#define SRC_HPP
-
-#include <vector>
+#pragma once
+#include "interface.h"
+#include "definition.h"
 #include <algorithm>
-#include <queue>
-#include <map>
+#include <vector>
 #include <cmath>
+#include <map>
+#include <random>
 
-// Basic task structure
-struct Task {
-    int id;
-    int workload;
-    int deadline;
-    int priority;
-    int arrival_time;
-    int remaining_work;
+namespace oj {
 
-    Task(int i, int w, int d, int p, int t = 0)
-        : id(i), workload(w), deadline(d), priority(p), arrival_time(t), remaining_work(w) {}
-};
-
-// Container structure
-struct Container {
-    int task_id;
-    int servers;
-    int start_time;
-    int stage; // 0: startup, 1: execution, 2: saving
-    int stage_remaining;
-    int work_done_this_run;
-
-    Container(int tid, int s, int st, int stage_rem = 0)
-        : task_id(tid), servers(s), start_time(st), stage(0),
-          stage_remaining(stage_rem), work_done_this_run(0) {}
-};
-
-// Global constants (these would typically come from definition.h)
-constexpr int kStartUp = 1;
-constexpr int kSaving = 1;
-constexpr double c = 1.0; // power constant
-
-// Global state for scheduler
-std::map<int, Task> all_tasks;
-std::vector<Container> running_containers;
-int current_time = 0;
-int total_servers = 0;
-
-// Client generator function
-std::vector<Task> generate_tasks(int num_servers, int num_tasks,
-                                 int min_deadline, int max_deadline,
-                                 int min_workload, int max_workload,
-                                 int min_priority, int max_priority) {
+// Simple, safe task generator
+auto generate_tasks(const Description &desc) -> std::vector<Task> {
     std::vector<Task> tasks;
+    tasks.reserve(desc.task_count);
 
-    // Generate simple tasks
-    for (int i = 0; i < num_tasks; i++) {
-        int workload = min_workload + (rand() % (max_workload - min_workload + 1));
-        int deadline = min_deadline + (rand() % (max_deadline - min_deadline + 1));
-        int priority = min_priority + (rand() % (max_priority - min_priority + 1));
+    std::mt19937_64 rng(42);
 
-        tasks.emplace_back(i, workload, deadline, priority);
+    // Use middle values for sums
+    time_t target_exec_sum = (desc.execution_time_sum.min + desc.execution_time_sum.max) / 2;
+    priority_t target_prio_sum = (desc.priority_sum.min + desc.priority_sum.max) / 2;
+
+    // Distribute evenly
+    time_t base_exec = target_exec_sum / desc.task_count;
+    priority_t base_prio = target_prio_sum / desc.task_count;
+
+    time_t actual_exec_sum = 0;
+    priority_t actual_prio_sum = 0;
+
+    double max_cpu_power = std::pow((double)PublicInformation::kCPUCount, PublicInformation::kAccel);
+
+    for (size_t i = 0; i < desc.task_count; ++i) {
+        time_t exec_time, deadline, launch_time;
+        priority_t priority;
+
+        if (i < desc.task_count - 1) {
+            exec_time = std::clamp(base_exec, desc.execution_time_single.min, desc.execution_time_single.max);
+            priority = std::clamp(base_prio, desc.priority_single.min, desc.priority_single.max);
+        } else {
+            // Last task adjusts to hit target sum exactly
+            exec_time = target_exec_sum - actual_exec_sum;
+            exec_time = std::clamp(exec_time, desc.execution_time_single.min, desc.execution_time_single.max);
+
+            priority = target_prio_sum - actual_prio_sum;
+            priority = std::clamp(priority, desc.priority_single.min, desc.priority_single.max);
+        }
+
+        actual_exec_sum += exec_time;
+        actual_prio_sum += priority;
+
+        // Calculate minimum time to complete
+        time_t min_time = (time_t)std::ceil(
+            PublicInformation::kStartUp +
+            PublicInformation::kSaving +
+            exec_time / max_cpu_power
+        ) + 2; // Add 2 for safety
+
+        // Simple: launch all tasks at time 0
+        launch_time = 0;
+
+        // Set deadline with sufficient slack
+        deadline = std::clamp(min_time + 100, desc.deadline_time.min, desc.deadline_time.max);
+
+        tasks.push_back(Task{
+            .launch_time = launch_time,
+            .deadline = deadline,
+            .execution_time = exec_time,
+            .priority = priority
+        });
     }
 
     return tasks;
 }
 
-// Server scheduler function
-std::vector<int> schedule_tasks(int time, const std::vector<Task>& new_tasks, int num_servers) {
-    current_time = time;
-    total_servers = num_servers;
+} // namespace oj
 
-    // Add new tasks to global state
-    for (const auto& task : new_tasks) {
-        all_tasks[task.id] = task;
+namespace oj {
+
+// Scheduler state
+struct TaskInfo {
+    time_t execution_time;
+    time_t deadline;
+    priority_t priority;
+    double work_done;
+    bool completed;
+    bool running;
+    cpu_id_t current_cpus;
+    time_t launch_start;
+};
+
+static std::map<task_id_t, TaskInfo> all_tasks;
+static std::vector<task_id_t> running_tasks;
+
+auto schedule_tasks(time_t time, std::vector<Task> list, const Description &desc) -> std::vector<Policy> {
+    static task_id_t task_id = 0;
+    const task_id_t first_id = task_id;
+
+    std::vector<Policy> policies;
+
+    // Add new tasks to our state
+    for (size_t i = 0; i < list.size(); ++i) {
+        const auto &task = list[i];
+        all_tasks[first_id + i] = TaskInfo{
+            .execution_time = task.execution_time,
+            .deadline = task.deadline,
+            .priority = task.priority,
+            .work_done = 0.0,
+            .completed = false,
+            .running = false,
+            .current_cpus = 0,
+            .launch_start = 0
+        };
     }
 
-    // Simple greedy scheduling: prioritize by priority/time ratio
-    std::vector<int> schedule;
+    task_id += list.size();
 
-    // Calculate available servers
-    int used_servers = 0;
-    for (const auto& container : running_containers) {
-        used_servers += container.servers;
-    }
-    int available_servers = num_servers - used_servers;
+    // Check running tasks and decide whether to save or cancel
+    std::vector<task_id_t> still_running;
+    cpu_id_t used_cpus = 0;
 
-    // Sort tasks by priority and deadline
-    std::vector<std::pair<int, int>> task_priority;
-    for (const auto& [id, task] : all_tasks) {
-        if (task.remaining_work > 0 && task.deadline > time) {
-            int urgency = task.priority * 1000 / (task.deadline - time + 1);
-            task_priority.emplace_back(urgency, id);
+    for (auto tid : running_tasks) {
+        auto &info = all_tasks[tid];
+        if (!info.running) continue;
+
+        // Calculate work done so far
+        time_t duration = time - info.launch_start;
+        double work = time_policy(duration, info.current_cpus);
+
+        // Decide: should we save this task?
+        bool should_save = false;
+
+        if (info.work_done + work >= info.execution_time) {
+            // Task completed
+            should_save = true;
+        } else if (time + PublicInformation::kSaving >= info.deadline) {
+            // Not enough time to complete, save what we have
+            should_save = true;
+        } else if (duration >= PublicInformation::kStartUp + 10) {
+            // Save checkpoints periodically
+            should_save = (duration % 20 == 0);
         }
-    }
-    std::sort(task_priority.rbegin(), task_priority.rend());
 
-    // Schedule high priority tasks
-    for (const auto& [urgency, task_id] : task_priority) {
-        if (available_servers > 0) {
-            int servers_to_use = std::min(available_servers,
-                                         (int)std::sqrt(all_tasks[task_id].remaining_work));
-            if (servers_to_use > 0) {
-                schedule.push_back(task_id);
-                schedule.push_back(servers_to_use);
-                available_servers -= servers_to_use;
+        if (should_save && duration >= PublicInformation::kStartUp) {
+            policies.push_back(Saving{.task_id = tid});
+            info.work_done += work;
+            info.running = false;
 
-                // Start a new container
-                running_containers.emplace_back(task_id, servers_to_use, time, kStartUp);
+            if (info.work_done >= info.execution_time) {
+                info.completed = true;
             }
+        } else {
+            still_running.push_back(tid);
+            used_cpus += info.current_cpus;
         }
     }
 
-    return schedule;
+    running_tasks = still_running;
+
+    // Priority queue: schedule urgent, high-priority tasks
+    std::vector<std::pair<double, task_id_t>> candidates;
+
+    for (const auto &[tid, info] : all_tasks) {
+        if (info.completed || info.running) continue;
+        if (info.deadline <= time) continue;
+
+        double remaining_work = info.execution_time - info.work_done;
+        if (remaining_work <= 0) continue;
+
+        time_t time_left = info.deadline - time - PublicInformation::kStartUp - PublicInformation::kSaving;
+        if (time_left <= 0) continue;
+
+        // Priority score: higher priority, less time left, more urgent
+        double urgency = (double)info.priority / (time_left + 1) * remaining_work;
+        candidates.push_back({urgency, tid});
+    }
+
+    // Sort by urgency (descending)
+    std::sort(candidates.begin(), candidates.end(), std::greater<>());
+
+    // Launch tasks with available CPUs
+    for (const auto &[urgency, tid] : candidates) {
+        if (used_cpus >= desc.cpu_count) break;
+
+        auto &info = all_tasks[tid];
+        double remaining_work = info.execution_time - info.work_done;
+        time_t time_left = info.deadline - time - PublicInformation::kStartUp - PublicInformation::kSaving;
+
+        // Calculate optimal CPU allocation
+        double min_power = remaining_work / time_left;
+        cpu_id_t min_cpus = std::max(1UL, (cpu_id_t)std::ceil(std::pow(min_power, 1.0 / PublicInformation::kAccel)));
+
+        // Don't use too many CPUs (diminishing returns)
+        cpu_id_t target_cpus = std::min(min_cpus, (cpu_id_t)20);
+        target_cpus = std::min(target_cpus, desc.cpu_count - used_cpus);
+
+        if (target_cpus > 0) {
+            policies.push_back(Launch{.cpu_cnt = target_cpus, .task_id = tid});
+            info.running = true;
+            info.current_cpus = target_cpus;
+            info.launch_start = time;
+            running_tasks.push_back(tid);
+            used_cpus += target_cpus;
+        }
+    }
+
+    return policies;
 }
 
-#endif // SRC_HPP
+} // namespace oj
